@@ -30,7 +30,7 @@ from sklearn.tree import DecisionTreeClassifier, export_text, plot_tree
 # Paths
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent
-PROJECT_ROOT = SCRIPT_DIR.parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
 TRAIN_PATH = DATA_DIR / "training_set.parquet"

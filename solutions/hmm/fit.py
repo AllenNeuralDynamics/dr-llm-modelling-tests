@@ -26,7 +26,7 @@ from sklearn.metrics import (
 # Paths
 # ---------------------------------------------------------------------------
 HERE = Path(__file__).parent
-DATA_DIR = HERE.parent / "data"
+DATA_DIR = HERE.parent.parent / "data"
 REPORT_PATH = HERE / "REPORT.md"
 
 FEATURE_COLS = [

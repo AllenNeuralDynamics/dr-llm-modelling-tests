@@ -1,11 +1,20 @@
 """
-Rescorla-Wagner reinforcement-learning model for mouse context-switching behaviour.
+Bayesian context-inference RL model v2 with FIXED reward likelihoods.
 
-Fits per-subject parameters (alpha_pos, alpha_neg, beta, bias) via maximum
-likelihood, then evaluates predictions on a held-out test set.
+The previous model (context_rl) estimated p_reward_correct and p_reward_incorrect as
+free parameters, but they collapsed to boundary values (0.5 and 0.0) making the
+Bayesian update barely functional.
+
+This v2 model fixes the reward likelihoods to their true task values:
+  - P(reward | responded to target in correct context) = 1.0
+  - P(reward | responded to target in wrong context) = 0.0
+
+This makes the Bayesian update maximally sharp: a single rewarded target trial
+provides definitive evidence about context.  The model has 4 free parameters per
+subject (beta, bias, gamma, v_nontgt) instead of 6.
 
 Run from project root:
-    uv run python rl_model/fit.py
+    uv run python context_rl_v2/fit.py
 """
 
 from __future__ import annotations
@@ -28,7 +37,7 @@ from sklearn.metrics import (
 # Paths
 # ---------------------------------------------------------------------------
 HERE = Path(__file__).parent
-DATA_DIR = HERE.parent / "data"
+DATA_DIR = HERE.parent.parent / "data"
 REPORT_PATH = HERE / "REPORT.md"
 
 STIMULUS_COLS = [
@@ -38,23 +47,42 @@ STIMULUS_COLS = [
     "is_aud_non_target",
 ]
 
-# Parameter bounds: (alpha_pos, alpha_neg, beta, bias)
+# Stimulus index mapping:
+#   0 = vis_target, 1 = vis_non_target, 2 = aud_target, 3 = aud_non_target
+STIM_VIS_TGT = 0
+STIM_VIS_NONTGT = 1
+STIM_AUD_TGT = 2
+STIM_AUD_NONTGT = 3
+
+# Parameter order: beta, bias, gamma, v_nontgt
+PARAM_NAMES = ["beta", "bias", "gamma", "v_nontgt"]
+
 BOUNDS = [
-    (1e-3, 1.0),   # alpha_pos
-    (1e-3, 1.0),   # alpha_neg
-    (0.1, 20.0),   # beta
-    (-5.0, 5.0),   # bias
+    (0.1, 20.0),    # beta
+    (-10.0, 10.0),  # bias
+    (0.001, 0.5),   # gamma
+    (-5.0, 0.0),    # v_nontgt
 ]
 
-# Initial guesses for multi-start optimisation
+# Multi-start initial guesses (4 parameters each)
 INIT_GUESSES = [
-    [0.3, 0.3, 5.0, 0.0],
-    [0.1, 0.1, 2.0, -1.0],
-    [0.5, 0.5, 10.0, 1.0],
-    [0.05, 0.2, 3.0, 0.0],
+    [5.0, -1.0, 0.05, -2.0],
+    [3.0, -2.0, 0.1, -1.0],
+    [8.0, 0.0, 0.02, -3.0],
+    [2.0, -1.0, 0.2, -0.5],
 ]
 
-Q_INIT = 0.5  # initial Q-value for all stimuli
+P_VIS_INIT = 0.5  # initial context belief: maximum uncertainty
+
+# Fixed reward likelihoods (the key change from v1)
+# Small epsilon to avoid log(0) in numerical computations
+LIK_EPSILON = 0.001
+LIK_HIGH = 1.0 - LIK_EPSILON  # 0.999
+LIK_LOW = LIK_EPSILON          # 0.001
+
+# Belief clipping bounds
+BELIEF_MIN = 0.001
+BELIEF_MAX = 0.999
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +93,7 @@ def _derive_reward(df: pd.DataFrame) -> np.ndarray:
     """Derive per-trial reward from the *next* trial's ``previous_reward``.
 
     For the last trial in each subject-session we cannot know the reward, so we
-    set it to NaN (the update step will be skipped for that trial).
+    set it to NaN (the belief update step will be skipped for that trial).
     """
     reward = np.full(len(df), np.nan)
     reward[:-1] = df["previous_reward"].values[1:].astype(float)
@@ -82,42 +110,102 @@ def run_model_forward(
     stim_idx: np.ndarray,
     responses: np.ndarray,
     rewards: np.ndarray,
-) -> np.ndarray:
-    """Run the RW model forward and return P(lick) for every trial.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run the Bayesian context-inference model forward with fixed likelihoods.
 
     Parameters
     ----------
     params : array of shape (4,)
-        [alpha_pos, alpha_neg, beta, bias]
+        [beta, bias, gamma, v_nontgt]
     stim_idx : int array of shape (n_trials,)
         Index (0-3) indicating which stimulus was presented.
-    responses : bool array of shape (n_trials,)
-        Whether the mouse licked.
+    responses : bool/float array of shape (n_trials,)
+        Whether the mouse licked (1.0 = lick, 0.0 = no lick).
     rewards : float array of shape (n_trials,)
         1.0 = rewarded, 0.0 = not rewarded, NaN = unknown (skip update).
 
     Returns
     -------
     p_lick : array of shape (n_trials,)
+        Model-predicted probability of licking on each trial.
+    p_vis_trace : array of shape (n_trials,)
+        Context belief p_vis at each trial (before decision, after prior leak).
     """
-    alpha_pos, alpha_neg, beta, bias = params
+    beta, bias, gamma, v_nontgt = params
     n = len(stim_idx)
-    q = np.full(4, Q_INIT, dtype=np.float64)
     p_lick = np.empty(n, dtype=np.float64)
+    p_vis_trace = np.empty(n, dtype=np.float64)
+
+    p_vis = P_VIS_INIT  # belief: P(current context = visual-rewarded)
 
     for t in range(n):
         s = stim_idx[t]
-        p_lick[t] = expit(beta * q[s] + bias)
 
-        # Update Q only if the mouse responded and reward is known
-        if responses[t] and not np.isnan(rewards[t]):
-            if rewards[t] == 1.0:
-                q[s] += alpha_pos * (1.0 - q[s])
+        # --- Prior leak: account for possible context switch ---
+        p_vis_prior = gamma * 0.5 + (1.0 - gamma) * p_vis
+
+        # Record the belief used for this trial's decision
+        p_vis_trace[t] = p_vis_prior
+
+        # --- Compute value of current stimulus given context belief ---
+        if s == STIM_VIS_TGT:
+            value = p_vis_prior
+        elif s == STIM_AUD_TGT:
+            value = 1.0 - p_vis_prior
+        else:
+            # Non-target stimuli: fixed low value
+            value = v_nontgt
+
+        # --- Decision ---
+        p_lick[t] = expit(beta * value + bias)
+
+        # --- Bayesian belief update (only if mouse responded AND reward is known) ---
+        if not np.isnan(rewards[t]) and responses[t]:
+            # Mouse responded to a stimulus -- reward is informative about context
+            rewarded = rewards[t] == 1.0
+
+            if s == STIM_VIS_TGT:
+                # Responded to visual target
+                if rewarded:
+                    # Reward confirms visual context
+                    lik_vis = LIK_HIGH
+                    lik_aud = LIK_LOW
+                else:
+                    # No reward contradicts visual context
+                    lik_vis = LIK_LOW
+                    lik_aud = LIK_HIGH
+
+            elif s == STIM_AUD_TGT:
+                # Responded to auditory target
+                if rewarded:
+                    # Reward confirms auditory context
+                    lik_vis = LIK_LOW
+                    lik_aud = LIK_HIGH
+                else:
+                    # No reward contradicts auditory context
+                    lik_vis = LIK_HIGH
+                    lik_aud = LIK_LOW
+
             else:
-                q[s] += alpha_neg * (0.0 - q[s])
-        # No update when mouse did not respond
+                # Responded to non-target: reward is always 0, uninformative
+                # (non-targets are never rewarded regardless of context)
+                p_vis = p_vis_prior
+                continue
 
-    return p_lick
+            # Bayes' rule
+            numerator = p_vis_prior * lik_vis
+            denominator = p_vis_prior * lik_vis + (1.0 - p_vis_prior) * lik_aud
+
+            # Clip for numerical stability
+            denominator = max(denominator, 1e-12)
+            p_vis = numerator / denominator
+            p_vis = np.clip(p_vis, BELIEF_MIN, BELIEF_MAX)
+
+        else:
+            # No response or unknown reward: belief carries forward with leak
+            p_vis = p_vis_prior
+
+    return p_lick, p_vis_trace
 
 
 def neg_log_likelihood(
@@ -126,12 +214,12 @@ def neg_log_likelihood(
     responses: np.ndarray,
     rewards: np.ndarray,
 ) -> float:
-    """Negative log-likelihood of observed responses under the RW model."""
-    p_lick = run_model_forward(params, stim_idx, responses, rewards)
+    """Negative log-likelihood of observed responses under the model."""
+    p_lick, _ = run_model_forward(params, stim_idx, responses, rewards)
     # Clip for numerical stability
     eps = 1e-12
     p_lick = np.clip(p_lick, eps, 1.0 - eps)
-    ll = responses * np.log(p_lick) + (1 - responses) * np.log(1 - p_lick)
+    ll = responses * np.log(p_lick) + (1.0 - responses) * np.log(1.0 - p_lick)
     return -np.sum(ll)
 
 
@@ -152,7 +240,7 @@ def fit_subject(
     responses: np.ndarray,
     rewards: np.ndarray,
 ) -> tuple[np.ndarray, float]:
-    """Fit RW parameters for one subject via multi-start L-BFGS-B.
+    """Fit model parameters for one subject via multi-start L-BFGS-B.
 
     Returns
     -------
@@ -160,7 +248,7 @@ def fit_subject(
     best_nll : float
     """
     best_nll = np.inf
-    best_params = INIT_GUESSES[0]
+    best_params = np.array(INIT_GUESSES[0])
 
     for x0 in INIT_GUESSES:
         try:
@@ -210,14 +298,24 @@ def write_report(
 ) -> None:
     """Write a markdown report to REPORT_PATH."""
     lines: list[str] = []
-    lines.append("# Rescorla-Wagner Model -- Results\n")
-    lines.append("*Auto-generated by `rl_model/fit.py`*\n")
+    lines.append("# Bayesian Context-Inference RL Model v2 (Fixed Likelihoods) -- Results\n")
+    lines.append("*Auto-generated by `context_rl_v2/fit.py`*\n")
+
+    lines.append(
+        "This model fixes reward likelihoods to their true task values "
+        "(P(reward|correct context) = 1.0, P(reward|wrong context) = 0.0) "
+        "instead of estimating them as free parameters. The v1 model's "
+        "`p_reward_correct` and `p_reward_incorrect` collapsed to boundary "
+        "values (0.5 and 0.0), making the Bayesian update barely functional. "
+        "With fixed likelihoods, the p_vis trace should now show sharp context "
+        "switches after rewarded target trials.\n"
+    )
 
     # -- Fitted parameters summary --
     lines.append("## Fitted parameters (across all subjects)\n")
     lines.append("| Parameter | Median | IQR (25th) | IQR (75th) | Min | Max |")
     lines.append("|-----------|--------|------------|------------|-----|-----|")
-    for param in ["alpha_pos", "alpha_neg", "beta", "bias"]:
+    for param in PARAM_NAMES:
         vals = param_df[param]
         q25, q50, q75 = vals.quantile([0.25, 0.5, 0.75])
         lines.append(
@@ -225,6 +323,10 @@ def write_report(
             f"| {vals.min():.4f} | {vals.max():.4f} |"
         )
     lines.append(f"\nNumber of subjects: {n_subjects}\n")
+    lines.append(
+        "Fixed (not estimated): `p_reward_correct` = 1.0, "
+        "`p_reward_incorrect` = 0.0 (with epsilon = 0.001)\n"
+    )
 
     # -- Training metrics --
     lines.append("## Training-set metrics (in-sample)\n")
@@ -243,14 +345,19 @@ def write_report(
     # -- Example subject --
     lines.append(f"\n## Example subject trace (subject_id={example_subject_id})\n")
     lines.append(
-        "First 60 trials showing predicted P(lick) alongside the actual response "
-        "and stimulus type.\n"
+        "First 80 trials showing predicted P(lick), context belief p_vis, "
+        "alongside the actual response, stimulus type, and reward.\n"
     )
-    n_show = min(60, len(example_traces["p_lick"]))
     lines.append(
-        "| Trial | Stimulus | Response | Reward | P(lick) |"
+        "The `p_vis` column is the key interpretable output -- it should now show "
+        "**sharp context switches** after rewarded target trials, unlike the v1 model "
+        "where p_vis drifted gradually.\n"
     )
-    lines.append("|-------|----------|----------|--------|---------|")
+    n_show = min(80, len(example_traces["p_lick"]))
+    lines.append(
+        "| Trial | Stimulus | Response | Reward | P(lick) | p_vis |"
+    )
+    lines.append("|-------|----------|----------|--------|---------|-------|")
     stim_names = ["vis_tgt", "vis_nontgt", "aud_tgt", "aud_nontgt"]
     for t in range(n_show):
         s = stim_names[example_traces["stim_idx"][t]]
@@ -258,12 +365,14 @@ def write_report(
         rew_val = example_traces["rewards"][t]
         rew = "yes" if rew_val == 1.0 else ("no" if rew_val == 0.0 else "?")
         p = example_traces["p_lick"][t]
-        lines.append(f"| {t} | {s} | {r} | {rew} | {p:.3f} |")
+        pv = example_traces["p_vis"][t]
+        lines.append(f"| {t} | {s} | {r} | {rew} | {p:.3f} | {pv:.3f} |")
 
     lines.append("\n---\n")
     lines.append(
-        "Model: Rescorla-Wagner with asymmetric learning rates, "
-        "fitted per subject via maximum-likelihood (L-BFGS-B).\n"
+        "Model: Bayesian context-inference RL v2 with fixed reward likelihoods "
+        "and transition leak, fitted per subject via maximum-likelihood "
+        "(L-BFGS-B, 4 random starts).\n"
     )
 
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
@@ -322,26 +431,27 @@ def main() -> None:
         tr_rew = train_rewards[tr_mask]
 
         best_params, best_nll = fit_subject(tr_stim, tr_resp, tr_rew)
-        alpha_pos, alpha_neg, beta, bias = best_params
+        beta, bias_val, gamma, v_nontgt = best_params
 
         param_records.append({
             "subject_id": sid,
-            "alpha_pos": alpha_pos,
-            "alpha_neg": alpha_neg,
             "beta": beta,
-            "bias": bias,
+            "bias": bias_val,
+            "gamma": gamma,
+            "v_nontgt": v_nontgt,
             "nll": best_nll,
         })
 
         # In-sample predictions
-        train_p_all[tr_mask] = run_model_forward(best_params, tr_stim, tr_resp, tr_rew)
+        tr_p, _ = run_model_forward(best_params, tr_stim, tr_resp, tr_rew)
+        train_p_all[tr_mask] = tr_p
 
         # Test-set predictions (run forward with fitted params)
         te_mask = test_subj_arr == sid
         te_stim = test_stim[te_mask]
         te_resp = test_resp[te_mask]
         te_rew = test_rewards[te_mask]
-        te_p = run_model_forward(best_params, te_stim, te_resp, te_rew)
+        te_p, te_pvis = run_model_forward(best_params, te_stim, te_resp, te_rew)
         test_p_all[te_mask] = te_p
 
         # Save example traces for the first subject
@@ -351,14 +461,15 @@ def main() -> None:
                 "responses": te_resp,
                 "rewards": te_rew,
                 "p_lick": te_p,
+                "p_vis": te_pvis,
             }
 
         elapsed = time_mod.perf_counter() - t0
         if (i + 1) % 10 == 0 or (i + 1) == n_subjects:
             print(
                 f"  [{i + 1:>3}/{n_subjects}] subject {sid}: "
-                f"alpha+={alpha_pos:.3f} alpha-={alpha_neg:.3f} "
-                f"beta={beta:.2f} bias={bias:.2f}  "
+                f"beta={beta:.2f} bias={bias_val:.2f} gamma={gamma:.4f} "
+                f"v_nt={v_nontgt:.2f}  "
                 f"NLL={best_nll:.1f}  ({elapsed:.1f}s)"
             )
 
@@ -379,7 +490,7 @@ def main() -> None:
 
     # -- Parameter summary --
     print("\n=== Fitted parameters (median [IQR]) ===")
-    for param in ["alpha_pos", "alpha_neg", "beta", "bias"]:
+    for param in PARAM_NAMES:
         vals = param_df[param]
         q25, q50, q75 = vals.quantile([0.25, 0.5, 0.75])
         print(f"  {param}: {q50:.4f} [{q25:.4f} - {q75:.4f}]")

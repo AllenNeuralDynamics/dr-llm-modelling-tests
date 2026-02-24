@@ -23,7 +23,7 @@ from sklearn.preprocessing import PolynomialFeatures
 # Paths
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent
-DATA_DIR = SCRIPT_DIR.parent / "data"
+DATA_DIR = SCRIPT_DIR.parent.parent / "data"
 REPORT_PATH = SCRIPT_DIR / "REPORT.md"
 
 FEATURES = [

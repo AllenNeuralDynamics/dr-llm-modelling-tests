@@ -28,7 +28,7 @@ from sklearn.metrics import (
 # Paths
 # ---------------------------------------------------------------------------
 GLMM_DIR = Path(__file__).parent
-DATA_DIR = Path(__file__).parent.parent / "data"
+DATA_DIR = Path(__file__).parent.parent.parent / "data"
 REPORT_PATH = GLMM_DIR / "REPORT.md"
 
 FEATURES = [

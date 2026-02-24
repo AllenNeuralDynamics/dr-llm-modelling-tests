@@ -1,20 +1,16 @@
 """
-Bayesian context-inference RL model v2 with FIXED reward likelihoods.
+Bayesian context-inference RL model for mouse context-switching behaviour.
 
-The previous model (context_rl) estimated p_reward_correct and p_reward_incorrect as
-free parameters, but they collapsed to boundary values (0.5 and 0.0) making the
-Bayesian update barely functional.
+The mouse maintains a belief p_vis = P(current context = visual-rewarded) and
+updates it trial-by-trial via Bayes' rule.  Decisions are made via a sigmoid
+decision rule where the value of each stimulus depends on the context belief.
 
-This v2 model fixes the reward likelihoods to their true task values:
-  - P(reward | responded to target in correct context) = 1.0
-  - P(reward | responded to target in wrong context) = 0.0
-
-This makes the Bayesian update maximally sharp: a single rewarded target trial
-provides definitive evidence about context.  The model has 4 free parameters per
-subject (beta, bias, gamma, v_nontgt) instead of 6.
+Fits per-subject parameters (beta, bias, gamma, p_reward_correct,
+p_reward_incorrect, v_nontgt) via maximum likelihood, then evaluates
+predictions on a held-out test set.
 
 Run from project root:
-    uv run python context_rl_v2/fit.py
+    uv run python context_rl/fit.py
 """
 
 from __future__ import annotations
@@ -37,7 +33,7 @@ from sklearn.metrics import (
 # Paths
 # ---------------------------------------------------------------------------
 HERE = Path(__file__).parent
-DATA_DIR = HERE.parent / "data"
+DATA_DIR = HERE.parent.parent / "data"
 REPORT_PATH = HERE / "REPORT.md"
 
 STIMULUS_COLS = [
@@ -54,35 +50,27 @@ STIM_VIS_NONTGT = 1
 STIM_AUD_TGT = 2
 STIM_AUD_NONTGT = 3
 
-# Parameter order: beta, bias, gamma, v_nontgt
-PARAM_NAMES = ["beta", "bias", "gamma", "v_nontgt"]
+# Parameter order: beta, bias, gamma, p_reward_correct, p_reward_incorrect, v_nontgt
+PARAM_NAMES = ["beta", "bias", "gamma", "p_reward_correct", "p_reward_incorrect", "v_nontgt"]
 
 BOUNDS = [
     (0.1, 20.0),    # beta
     (-10.0, 10.0),  # bias
     (0.001, 0.5),   # gamma
+    (0.5, 1.0),     # p_reward_correct
+    (0.0, 0.5),     # p_reward_incorrect
     (-5.0, 0.0),    # v_nontgt
 ]
 
-# Multi-start initial guesses (4 parameters each)
+# Multi-start initial guesses
 INIT_GUESSES = [
-    [5.0, -1.0, 0.05, -2.0],
-    [3.0, -2.0, 0.1, -1.0],
-    [8.0, 0.0, 0.02, -3.0],
-    [2.0, -1.0, 0.2, -0.5],
+    [5.0, 0.0, 0.05, 0.9, 0.1, -2.0],
+    [3.0, -2.0, 0.1, 0.8, 0.2, -1.0],
+    [8.0, 1.0, 0.02, 0.95, 0.05, -3.0],
+    [2.0, -1.0, 0.2, 0.7, 0.1, -0.5],
 ]
 
 P_VIS_INIT = 0.5  # initial context belief: maximum uncertainty
-
-# Fixed reward likelihoods (the key change from v1)
-# Small epsilon to avoid log(0) in numerical computations
-LIK_EPSILON = 0.001
-LIK_HIGH = 1.0 - LIK_EPSILON  # 0.999
-LIK_LOW = LIK_EPSILON          # 0.001
-
-# Belief clipping bounds
-BELIEF_MIN = 0.001
-BELIEF_MAX = 0.999
 
 
 # ---------------------------------------------------------------------------
@@ -111,12 +99,12 @@ def run_model_forward(
     responses: np.ndarray,
     rewards: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run the Bayesian context-inference model forward with fixed likelihoods.
+    """Run the Bayesian context-inference model forward.
 
     Parameters
     ----------
-    params : array of shape (4,)
-        [beta, bias, gamma, v_nontgt]
+    params : array of shape (6,)
+        [beta, bias, gamma, p_reward_correct, p_reward_incorrect, v_nontgt]
     stim_idx : int array of shape (n_trials,)
         Index (0-3) indicating which stimulus was presented.
     responses : bool/float array of shape (n_trials,)
@@ -131,7 +119,7 @@ def run_model_forward(
     p_vis_trace : array of shape (n_trials,)
         Context belief p_vis at each trial (before decision, after prior leak).
     """
-    beta, bias, gamma, v_nontgt = params
+    beta, bias, gamma, p_rew_corr, p_rew_incorr, v_nontgt = params
     n = len(stim_idx)
     p_lick = np.empty(n, dtype=np.float64)
     p_vis_trace = np.empty(n, dtype=np.float64)
@@ -159,32 +147,30 @@ def run_model_forward(
         # --- Decision ---
         p_lick[t] = expit(beta * value + bias)
 
-        # --- Bayesian belief update (only if mouse responded AND reward is known) ---
+        # --- Bayesian belief update (only if reward is known) ---
         if not np.isnan(rewards[t]) and responses[t]:
-            # Mouse responded to a stimulus -- reward is informative about context
+            # Mouse responded -- reward is informative about context
             rewarded = rewards[t] == 1.0
 
             if s == STIM_VIS_TGT:
                 # Responded to visual target
                 if rewarded:
-                    # Reward confirms visual context
-                    lik_vis = LIK_HIGH
-                    lik_aud = LIK_LOW
+                    # P(reward | vis_context, responded to vis_tgt) = p_rew_corr
+                    # P(reward | aud_context, responded to vis_tgt) = p_rew_incorr
+                    lik_vis = p_rew_corr
+                    lik_aud = p_rew_incorr
                 else:
-                    # No reward contradicts visual context
-                    lik_vis = LIK_LOW
-                    lik_aud = LIK_HIGH
+                    lik_vis = 1.0 - p_rew_corr
+                    lik_aud = 1.0 - p_rew_incorr
 
             elif s == STIM_AUD_TGT:
                 # Responded to auditory target
                 if rewarded:
-                    # Reward confirms auditory context
-                    lik_vis = LIK_LOW
-                    lik_aud = LIK_HIGH
+                    lik_vis = p_rew_incorr
+                    lik_aud = p_rew_corr
                 else:
-                    # No reward contradicts auditory context
-                    lik_vis = LIK_HIGH
-                    lik_aud = LIK_LOW
+                    lik_vis = 1.0 - p_rew_incorr
+                    lik_aud = 1.0 - p_rew_corr
 
             else:
                 # Responded to non-target: reward is always 0, uninformative
@@ -199,7 +185,7 @@ def run_model_forward(
             # Clip for numerical stability
             denominator = max(denominator, 1e-12)
             p_vis = numerator / denominator
-            p_vis = np.clip(p_vis, BELIEF_MIN, BELIEF_MAX)
+            p_vis = np.clip(p_vis, 1e-6, 1.0 - 1e-6)
 
         else:
             # No response or unknown reward: belief carries forward with leak
@@ -244,7 +230,7 @@ def fit_subject(
 
     Returns
     -------
-    best_params : array of shape (4,)
+    best_params : array of shape (6,)
     best_nll : float
     """
     best_nll = np.inf
@@ -298,18 +284,8 @@ def write_report(
 ) -> None:
     """Write a markdown report to REPORT_PATH."""
     lines: list[str] = []
-    lines.append("# Bayesian Context-Inference RL Model v2 (Fixed Likelihoods) -- Results\n")
-    lines.append("*Auto-generated by `context_rl_v2/fit.py`*\n")
-
-    lines.append(
-        "This model fixes reward likelihoods to their true task values "
-        "(P(reward|correct context) = 1.0, P(reward|wrong context) = 0.0) "
-        "instead of estimating them as free parameters. The v1 model's "
-        "`p_reward_correct` and `p_reward_incorrect` collapsed to boundary "
-        "values (0.5 and 0.0), making the Bayesian update barely functional. "
-        "With fixed likelihoods, the p_vis trace should now show sharp context "
-        "switches after rewarded target trials.\n"
-    )
+    lines.append("# Bayesian Context-Inference RL Model -- Results\n")
+    lines.append("*Auto-generated by `context_rl/fit.py`*\n")
 
     # -- Fitted parameters summary --
     lines.append("## Fitted parameters (across all subjects)\n")
@@ -323,10 +299,6 @@ def write_report(
             f"| {vals.min():.4f} | {vals.max():.4f} |"
         )
     lines.append(f"\nNumber of subjects: {n_subjects}\n")
-    lines.append(
-        "Fixed (not estimated): `p_reward_correct` = 1.0, "
-        "`p_reward_incorrect` = 0.0 (with epsilon = 0.001)\n"
-    )
 
     # -- Training metrics --
     lines.append("## Training-set metrics (in-sample)\n")
@@ -349,9 +321,9 @@ def write_report(
         "alongside the actual response, stimulus type, and reward.\n"
     )
     lines.append(
-        "The `p_vis` column is the key interpretable output -- it should now show "
-        "**sharp context switches** after rewarded target trials, unlike the v1 model "
-        "where p_vis drifted gradually.\n"
+        "The `p_vis` column is the key interpretable output -- it should show the "
+        "model tracking block switches between visual-rewarded and auditory-rewarded "
+        "contexts.\n"
     )
     n_show = min(80, len(example_traces["p_lick"]))
     lines.append(
@@ -370,9 +342,8 @@ def write_report(
 
     lines.append("\n---\n")
     lines.append(
-        "Model: Bayesian context-inference RL v2 with fixed reward likelihoods "
-        "and transition leak, fitted per subject via maximum-likelihood "
-        "(L-BFGS-B, 4 random starts).\n"
+        "Model: Bayesian context-inference RL with transition leak, "
+        "fitted per subject via maximum-likelihood (L-BFGS-B, 4 random starts).\n"
     )
 
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
@@ -431,13 +402,15 @@ def main() -> None:
         tr_rew = train_rewards[tr_mask]
 
         best_params, best_nll = fit_subject(tr_stim, tr_resp, tr_rew)
-        beta, bias_val, gamma, v_nontgt = best_params
+        beta, bias_val, gamma, p_rew_corr, p_rew_incorr, v_nontgt = best_params
 
         param_records.append({
             "subject_id": sid,
             "beta": beta,
             "bias": bias_val,
             "gamma": gamma,
+            "p_reward_correct": p_rew_corr,
+            "p_reward_incorrect": p_rew_incorr,
             "v_nontgt": v_nontgt,
             "nll": best_nll,
         })
@@ -469,6 +442,7 @@ def main() -> None:
             print(
                 f"  [{i + 1:>3}/{n_subjects}] subject {sid}: "
                 f"beta={beta:.2f} bias={bias_val:.2f} gamma={gamma:.4f} "
+                f"p_corr={p_rew_corr:.3f} p_incorr={p_rew_incorr:.3f} "
                 f"v_nt={v_nontgt:.2f}  "
                 f"NLL={best_nll:.1f}  ({elapsed:.1f}s)"
             )
