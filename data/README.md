@@ -1,7 +1,7 @@
 # Data
 
-The parquet files for this experiment contain data from one session per subject, after they reached the
-learning criterion (Stage 3 passed). Each row corresponds to one trial, and the columns contain information about the
+The parquet files for this experiment contain concatenated data from multiple sessions, with one
+session per subject. Each subject had reached the learning criterion (Stage 3 passed). Each row corresponds to one trial, and the columns contain information about the
 stimulus presented, the subject's response, and other metadata, with the following schema:
 | column | type | allow in model |
 |---|---|---|
