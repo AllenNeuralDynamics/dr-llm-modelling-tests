@@ -6,10 +6,22 @@ Mice are initially trained in a go/nogo visual discrimination task in which they
 ### Stage 2: auditory discrimination
 After learning the visual discrimination task, mice are trained in an auditory discrimination task in which the target stimulus is 12 Hz amplitude-modulated (AM) noise and the non-target stimulus is 70 Hz AM noise. Other than the stimulus modality, all other aspects of this stage are the same as stage 1.
 ### Stage 3: context-switching task
-After learning the visual and auditory discrimination tasks, mice are trained on the audio-visual context-switching task. On each trial, one of the four stimuli (visual target, visual non-target, auditory target, or auditory non-target) is presented and mice are rewarded for responding to the visual target in visual-rewarded blocks or to the auditory target in auditory-rewarded blocks. Licks in response to the non-rewarded target for a given block, or to either of the non-target stimuli, are punished with a timeout. Each session consists of six, ten-minute blocks that alternate between rewarding responses to the visual or auditory target. The initial block of each session alternates in which target is rewarded across days. In the standard version of the task, each block begins with five consecutive trials in which the rewarded-target stimulus is presented and mice are given a non-contingent reward at the end of the response window if the mouse does not respond prior to this to earn a contingent reward. For all other trials, stimuli are presented in pseudo-random order to ensure an approximately equal number of presentations of each stimulus each block.
-Mice are deemed to have learned the context-switching task when their within-modality d' (comparing
-responses to the rewarded target and the non-target of the same modality) and cross-modality d'
-(comparing responses to the rewarded and non-rewarded targets) are both greater than 1.5 for at
-least 4/6 blocks for two consecutive sessions. After learning the task, mice continue training as
-described for stage 3 (except incorrect responses are no longer punished with timeouts) until they
-are used for electrophysiology or behavior experiments.
+After learning the visual and auditory discrimination tasks, mice are trained on the audio-visual context-switching task. On each trial, one of the four stimuli (visual target, visual non-target, auditory target, or auditory non-target) is presented and mice are rewarded for responding to the visual target in visual-rewarded blocks or to the auditory target in auditory-rewarded blocks. Licks in response to the non-rewarded target for a given block, or to either of the non-target stimuli, are punished with a timeout. Each session consists of six, ten-minute blocks that alternate between rewarding responses to the visual or auditory target. The initial block of each session alternates in which target is rewarded across days. In the standard version of the task, each block begins with five consecutive trials in which the rewarded-target stimulus is presented and mice are given a non-contingent reward at the end of the response window if the mouse does not respond prior to this to earn a contingent reward. For all other trials, stimuli are presented in pseudo-random order to ensure an approximately equal number of presentations of each stimulus each block. Mice are deemed to have learned the context-switching task when their within-modality d' (comparing responses to the rewarded target and the non-target of the same modality) and cross-modality d' (comparing responses to the rewarded and non-rewarded targets) are both greater than 1.5 for at least 4/6 blocks for two consecutive sessions. 
+### Stage 4: post-learning continued training, and ephys or behavior experiments
+After learning the task, mice continue training as described for stage 3 minus timeout punishments for incorrect responses, until they are used for electrophysiology or behavior experiments. Experiments also use this version of the task without timeout punishments.
+
+## Trial structure
+| quiescent period (-1.5 to 0 s) | stimulus (0 to 0.5 s) | response window (0.1-1.0 s) | ITI (3-7.5 s) |
+
+## Stimulus summary
+- audtory target: rewarded in auditory-rewarded blocks, unrewarded/punished in visual-rewarded blocks
+- visual target: unrewarded/punished in auditory-rewarded blocks, rewarded in visual-rewarded blocks
+- auditory non-target: unrewarded/punished in both blocks
+- visual non-target: unrewarded/punished in both blocks
+- catch (no stimulus): unrewarded/punished in both blocks
+
+## Stage 3 & 4 session/block structure
+- 60-minute session, maximum one session per day
+- six 10-minute blocks alternating auditory/visusal context (first block alternates daily)
+- instruction trials (first 5 trials in block): rewarded target stimulus presented, non-contingent reward available
+- all other trials: randomly interleaved stimuli, 10% catch trials, others equal probability
